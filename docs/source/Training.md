@@ -1,6 +1,12 @@
 # Training a Model
 
-CREDIT v2.0 supports three modes for training a model. In your configuration file (`model.yml`), under the `trainer` field, you can set `mode` to one of the following:
+:::{note}
+**New to CREDIT?** Jump straight to [Training with the v2 Data Schema](#training-with-the-v2-data-schema) —
+it is the recommended path for all new experiments and uses a single `credit` command for everything.
+The sections below document the legacy v1 workflow.
+:::
+
+CREDIT supports three modes for training a model. In your configuration file (`model.yml`), under the `trainer` field, you can set `mode` to one of the following:
 
 - `None`: Trains on a single GPU without any special distributed settings.
 - `ddp`: Uses **Distributed Data Parallel (DDP)** for multi-GPU training.
@@ -11,7 +17,7 @@ CREDIT v2.0 supports three modes for training a model. In your configuration fil
 To start a training run from epoch 0, use:
 
 ```bash
-python applications/train.py -c config/model.yml
+credit_train -c config/model.yml
 ```
 
 Ensure the `trainer` section in `model.yml` is set as follows:
@@ -58,129 +64,85 @@ trainer:
 Then, start training as usual:
 
 ```bash
-python applications/train.py -c config/model.yml
+credit_train -c config/model.yml
 ```
 
-This command generates a **launch script (`launch.sh`)** and submits a job on **Derecho**, allocating the required number of nodes and GPUs. The settings for this job are controlled by the `pbs` field in `model.yml`.
+This command generates a PBS script and submits it via `qsub`.
+Job resources are controlled by the `pbs:` section of your config — see below.
 
-### Example PBS Configuration (Derecho)
+### PBS configuration in your config file
+
+The `pbs:` block is the primary place to set your **allocation code**, walltime, node count,
+conda environment, and other job parameters. You do not need to pass these on the command line
+every time.
 
 ```yaml
+# ---- Derecho ----------------------------------------------------------------
 pbs:
-    conda: "credit-derecho"
-    project: "NAML0001"
-    job_name: "train_model"
-    walltime: "12:00:00"
-    nodes: 8
-    ncpus: 64
-    ngpus: 4
-    mem: '480GB'
-    queue: 'main'
+    project: "NCAR0001"        # YOUR allocation code (PBS -A) — change this!
+    job_name: "credit_gen2"      # job name shown in qstat
+    walltime: "12:00:00"       # wall-clock limit per job (HH:MM:SS)
+    nodes: 1                   # number of nodes (derecho only; casper is always 1)
+    ncpus: 64                  # CPUs per node
+    ngpus: 4                   # GPUs per node
+    mem: ‘480GB’               # memory per node
+    queue: ‘main’              # queue name
+    conda: "credit-derecho"    # conda env name or full path
 ```
-
-- **`conda`**: The environment containing the `miles-credit` installation.
-- **`project`**: Your project code.
-- **`nodes`** and **`ngpus`**: The number of nodes and GPUs per node. In this example, `8 nodes × 4 GPUs` = **32 GPUs total**.
-
-### Example `launch.sh` Script for Derecho
-
-```bash
-#!/bin/bash
-#PBS -A NAML0001
-#PBS -N train_model
-#PBS -l walltime=12:00:00
-#PBS -l select=1:ncpus=64:ngpus=4
-#PBS -q main
-#PBS -j oe
-#PBS -k eod
-#PBS -r n
-
-# Load modules
-module purge
-module load ncarenv/23.09
-module reset
-module load gcc craype cray-mpich cuda cudnn/8.8.1.3-12 conda
-conda activate credit-derecho
-
-# Export environment variables
-export LSCRATCH=/glade/derecho/scratch/schreck/
-export LOGLEVEL=INFO
-export NCCL_DEBUG=INFO
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export NCCL_SOCKET_IFNAME=hsn
-export MPICH_GPU_MANAGED_MEMORY_SUPPORT_ENABLED=1
-export MPICH_OFI_NIC_POLICY=GPU
-export MPICH_GPU_SUPPORT_ENABLED=1
-export NCCL_IB_DISABLE=1
-export NCCL_CROSS_NIC=1
-export NCCL_NCHANNELS_PER_NET_PEER=4
-export MPICH_RDMA_ENABLED_CUDA=1
-export NCCL_NET="AWS Libfabric"
-export NCCL_NET_GDR_LEVEL=PBH
-export FI_CXI_DISABLE_HOST_REGISTER=1
-export FI_CXI_OPTIMIZED_MRS=false
-export FI_MR_CACHE_MONITOR=userfaultfd
-export FI_CXI_DEFAULT_CQ_SIZE=131072
-
-# Log GPU and node details
-echo "Number of nodes: 1"
-echo "Number of GPUs per node: 32"
-echo "Total number of GPUs: 4"
-
-# Find head node's IP
-nodes=( $(cat $PBS_NODEFILE) )
-head_node=${nodes[0]}
-head_node_ip=$(ssh $head_node hostname -i | awk '{print $1}')
-
-# Launch training
-MASTER_ADDR=$head_node_ip MASTER_PORT=1234 mpiexec -n 4 --ppn 4 --cpu-bind none \
-    python applications/train.py -c model.yml --backend nccl
-```
-
-This script utilizes **MPI** for coordinating training across **multiple nodes and GPUs**. It includes necessary environment variables for Derecho’s system configuration. **Users should not need to modify this script**, as it is tailored for Derecho and may change with system updates.
-
-## Running on Casper vs. Derecho
-
-For **Casper**, modify `model.yml` as follows:
 
 ```yaml
+# ---- Casper -----------------------------------------------------------------
 pbs:
-    conda: "credit"
-    project: "NAML0001"
-    job_name: "train_model"
-    nodes: 1
+    project: "NCAR0001"
+    job_name: "credit_gen2"
+    walltime: "04:00:00"
     ncpus: 8
     ngpus: 1
-    mem: '128GB'
-    walltime: '4:00:00'
-    gpu_type: 'a100'
-    queue: 'casper'
+    mem: ‘128GB’               # optional: omit to scale memory with ngpus
+    queue: ‘casper’
+    gpu_type: ‘a100_80gb’      # optional: a100_80gb, v100, h100, etc.
+                               # omit it to run on any available NVIDIA GPGPU
+    conda: "credit"
 ```
 
-Once again, to launch the job on Casper, run:
+**Casper memory scaling** — when `mem` is not set (in the config or via `--mem`), `credit submit`
+sizes the request to the share of the node the job occupies: 64GB for a single GPU, growing
+linearly to (nearly) the whole node's memory when the job takes every GPU on that node type.
+Node sizes come from the [Casper hardware
+table](https://ncar-hpc-docs.readthedocs.io/en/latest/compute-systems/casper/#casper-hardware):
 
-```bash
-python applications/train.py -c config/model.yml -l 1
+| `gpu_type` | GPUs/node | 1 GPU | 2 GPUs | 4 GPUs | 8 GPUs |
+|---|---|---|---|---|---|
+| unset (any GPGPU) / `v100` | 8 (1152GB) | 64GB | 224GB | 512GB | 1088GB |
+| `a100_80gb` / `h100` | 4 (1024GB) | 64GB | 368GB | 960GB | — |
+
+**Queue / cluster mismatch** — a `pbs:` block written for one machine is easy to reuse against the
+other, and PBS only rejects the bad queue after the job is submitted. `credit submit` therefore fails
+up front when the resolved queue belongs to the other cluster:
+
+```
+$ credit submit --cluster casper -c derecho_config.yml --dry-run
+ERROR: queue 'main' is a Derecho queue, but this job targets casper.
+Casper queues: casper, cpu, gpgpu, gpudev, htc, l40, largemem, rda, vis.
+Fix the 'queue:' in the config's pbs block, or override it with --queue.
 ```
 
-This command generates a **launch script (`launch.sh`)**, which will look like:
+Pass `--queue casper` to override the config for a one-off run, or edit the block. Queues valid on
+both machines (`gpudev`) and unrecognized/site-specific queue names are left alone. `credit check`
+reports which cluster a config's queue implies.
 
-```bash
-#!/bin/bash -l
-#PBS -N train_model
-#PBS -l select=1:ncpus=8:ngpus=1:mem=128g
-#PBS -l walltime=4:00:00
-#PBS -l gpu_type=a100
-#PBS -A NAML0001
-#PBS -q casper
-#PBS -j oe
-#PBS -k eod
-source ~/.bashrc
-conda activate credit
-torchrun applications/train.py -c model.yml
-```
+**Resolution order** — the same setting can come from three places, highest priority first:
 
-and note that the ```torchrun``` command is used rather than MPIs. For now MPIs are not supported on Casper but that will change in a future release. But to get torch to run in distributed mode (either DDP or FSDP) we use torchrun to faciliate that (rather than setting that up manuanlly in train.py). 
+| Priority | Source | Example |
+|---|---|---|
+| 1 | CLI flag | `--account NCAR0001 --gpus 4` |
+| 2 | `pbs:` section in config | `project: "NCAR0001"` |
+| 3 | Built-in cluster default | 4 GPUs, 12 h walltime, etc. |
+
+You can also export `PBS_ACCOUNT` in your shell as a global fallback for the account code
+(useful if you work across multiple configs but always charge the same project).
+
+## Running on Casper vs. Derecho
 
 ### Key Differences
 
@@ -193,4 +155,415 @@ and note that the ```torchrun``` command is used rather than MPIs. For now MPIs 
 | GPU Type        | A100             | V100/A100/H100         |
 | Queue          | `main`            | `casper`      |
 
-Casper is best for **small-scale experiments**, while Derecho is designed for **large-scale, multi-node training**. Derecho only has A100 GPUs with 40 Gb of memory. Casper has both 40 Gb and 80 Gb A100s along with a small number of H100s with 80 Gb of memory.
+Casper is best for **small-scale experiments**, while Derecho is designed for **large-scale, multi-node training**.
+Derecho only has A100 GPUs with 40 Gb of memory. Casper has both 40 Gb and 80 Gb A100s along with a small
+number of H100s with 80 Gb of memory.
+
+---
+
+## Training with the v2 Data Schema
+
+CREDIT v2 is the recommended path for all new experiments. It uses a cleaner nested
+data schema with explicit variable categories (`prognostic`, `diagnostic`,
+`dynamic_forcing`, `static`) and a unified `credit` command for everything.
+
+### Quickstart on Casper or Derecho
+
+```bash
+# 1. Activate the pre-built environment (NCAR users)
+#    Casper:
+conda activate /glade/u/home/schreck/.conda/envs/credit-casper
+#    Derecho:
+#    conda activate /glade/work/benkirk/conda-envs/credit-derecho-torch28-nccl221
+
+# 2. Clone the repo and install
+git clone https://github.com/NCAR/miles-credit.git
+cd miles-credit
+pip install -e . --no-deps
+
+# 3. Generate a config from a built-in template
+credit init --grid 1deg -o my_experiment.yml      # or --grid 0.25deg for full-res
+
+# 4. Set your allocation in the pbs: section of my_experiment.yml, then submit.
+#    --chain auto-computes job count from ceil(epochs / num_epoch) in the config.
+credit submit --cluster casper  -c my_experiment.yml --chain 10
+credit submit --cluster derecho -c my_experiment.yml --chain 10
+```
+
+That's it. `--chain 10` submits 10 back-to-back jobs via PBS `afterok` dependencies —
+no manual resubmission needed.
+
+:::{note}
+**NCAR users**: data paths in the built-in configs point to
+`/glade/campaign/cisl/aiml/ksha/CREDIT_data/` which is readable by all NCAR staff.
+`save_loc` defaults to `/glade/derecho/scratch/$USER/CREDIT_runs/...` — no config
+edits required to get started.
+:::
+
+### How many jobs do I need?
+
+Rule of thumb: `--chain = ceil(total_epochs / epochs_per_job)`.
+
+`num_epoch` in the trainer config controls how many epochs run per job submission
+(default 5). `epochs` is the total training target (default 70).
+
+| total epochs | epochs/job (`num_epoch`) | `--chain` |
+|---|---|---|
+| 70 | 5 | 14 |
+| 70 | 10 | 7 |
+| 100 | 10 | 10 |
+
+Use `--dry-run` to inspect the PBS scripts before submitting:
+
+```bash
+credit submit --cluster derecho -c my_experiment.yml --chain 10 --dry-run
+```
+
+### Available configs
+
+| Grid | File | Notes |
+|------|------|-------|
+| 1° | `config/wxformer_1dg_6hr_v2.yml` | ERA5 model-level — good starting point |
+| 0.25° | `config/wxformer_025deg_6hr_v2.yml` | Full-res pressure-level, 13 levels |
+| starter | `config/starter_v2.yml` | Minimal template with `USER SETTINGS` comments |
+
+### What does a healthy training run look like?
+
+After the first epoch, `train_loss` should be **O(1)** (roughly 1–3). It should
+decrease steadily across epochs. If losses are > 100 or growing, something is wrong
+with normalization or the data paths.
+
+Check progress at any time:
+
+```bash
+# Quick check: tail the CSV log
+tail -5 /glade/derecho/scratch/$USER/CREDIT_runs/my_run/training_log.csv
+
+# Global map: truth vs prediction in physical units (saves to <save_loc>/plots/)
+credit plot -c my_experiment.yml --field VAR_2T --denorm
+
+# Visual dashboard: TensorBoard (see Monitoring with TensorBoard for SSH forwarding)
+tensorboard --logdir /glade/derecho/scratch/$USER/CREDIT_runs/my_run/tensorboard
+```
+
+### Trainer configuration
+
+Set `trainer.type: era5-gen2` in your config. Key fields:
+
+```yaml
+trainer:
+    type: era5-gen2
+    parallelism:
+        data: ddp           # none | ddp | fsdp2
+        tensor: 1           # tensor-parallel degree (1 = disabled)
+        domain: 1           # domain-parallel shards (1 = disabled)
+    train_batch_size: 8     # per-GPU; total = batch_size × n_gpus
+    num_epoch: 5            # epochs per job submission
+    epochs: &epochs 70      # total training target
+    use_tensorboard: True   # write TensorBoard logs to save_loc/tensorboard/
+    use_ema: True           # recommended: EMA shadow weights for checkpointing
+    ema_decay: 0.9999
+    use_scheduler: True
+    scheduler:
+        scheduler_type: linear-warmup-cosine
+        warmup_steps: 1000
+        total_steps: 500000
+        min_lr: 1.0e-5
+```
+
+When `use_tensorboard: True`, metrics are written to `<save_loc>/tensorboard/` after each epoch.
+Launch the viewer from any machine with access to the filesystem:
+
+```bash
+tensorboard --logdir /glade/derecho/scratch/$USER/my_run/tensorboard
+```
+
+See [Monitoring with TensorBoard](tensorboard.md) for port-forwarding instructions for Casper and Derecho.
+
+### Gen2 parallelism: FSDP2, tensor parallel, and domain parallel
+
+The gen2 trainer supports three independent parallelism axes, controlled by a
+`parallelism:` block inside `trainer:`.
+
+```yaml
+trainer:
+    type: era5-gen2
+    parallelism:
+        data:   fsdp2   # "fsdp2" | "ddp" | "none"
+        tensor: 1       # tensor-parallel degree (1 = disabled)
+        domain: 1       # domain-parallel degree (1 = disabled)
+```
+
+The three axes compose freely. With `N` total GPUs:
+`dp_size = N / (tensor × domain)`, where `dp_size` is the number of FSDP2 or DDP
+data-parallel replicas.
+
+**Data parallelism (`data:`)** — `fsdp2` shards model parameters and gradients
+across the data-parallel group using PyTorch FSDP2. This is the recommended default
+for large models. Use `ddp` if you need gradient debugging or the model fits
+comfortably in one GPU's memory. With `fsdp2`, `amp: True` enables FSDP2's own
+`MixedPrecisionPolicy` (bf16 by default; override via `trainer.fsdp2_mp_policy`)
+instead of manual autocast — the trainer disables autocast and the GradScaler
+automatically because the policy replaces both. With spectral norm the policy
+is skipped (fp32 compute, sharding only) unless `fsdp2_mp_policy` is set
+explicitly.
+
+**Tensor parallelism (`tensor:`)** — splits each weight matrix column-wise across
+`tensor` GPUs within a node. This reduces per-GPU activation memory at the cost of
+intra-node all-reduce communication.
+
+> **Currently disabled.** `tensor > 1` raises `NotImplementedError`: the legacy
+> hand-rolled sharding slices fused projections (e.g. WXFormer's `to_qkv`)
+> across q/k/v boundaries and lacks the backward all-reduce at the
+> column-parallel input, so it trains mathematically wrong outputs and
+> gradients. Native TP via torch's `parallelize_module` lands with issue #415.
+> The protocol below documents the intended interface and stays in place for
+> that rewrite.
+
+**Adding TP support to a new model** — tensor parallelism uses an opt-in protocol.
+Any `nn.Module` block that wants TP support declares two class attributes pointing
+to its column-parallel and row-parallel projection layers:
+
+```python
+class MyBlock(nn.Module):
+    _tp_col = "proj_up"  # attribute path for the column-parallel layer
+    _tp_row = "proj_out"  # attribute path for the row-parallel layer
+    ...
+```
+
+The path is resolved with `getattr`, so dotted paths work for layers nested
+inside a `Sequential` (e.g. `"layers.1"`). Supported layer types are
+`nn.Conv2d` (1×1 kernels only) and `nn.Linear`.
+
+The column-parallel layer receives the **full** input and produces a
+**sharded** output (no all-reduce). The row-parallel layer receives the
+sharded input and issues an `all_reduce SUM`, so the rest of the graph
+sees the full output. This is the standard Megatron-style col→row pairing.
+
+WXFormer ships with this already wired up. `FeedForward` and `Attention`
+in `credit/models/wxformer/crossformer.py` declare:
+
+```python
+class FeedForward(nn.Module):
+    _tp_col = "layers.1"  # Conv2d(dim → dim*mult)
+    _tp_row = "layers.4"  # Conv2d(dim*mult → dim)
+
+
+class Attention(nn.Module):
+    _tp_col = "to_qkv"  # Conv2d(dim → inner_dim*3)
+    _tp_row = "to_out"  # Conv2d(inner_dim → dim)
+```
+
+Any model block that does **not** declare `_tp_col`/`_tp_row` is left
+unchanged when `tensor > 1`. If no blocks in the model declare these
+attributes, a warning is logged and TP is a no-op. There is no silent
+wrong-answer failure mode.
+
+**Domain parallelism (`domain:`)** — shards the spatial H dimension across `domain`
+GPUs. Each rank processes a latitude band of height `H_padded / domain`. This is
+useful when a single forward pass at high resolution exceeds GPU memory even with
+FSDP2. First, we pre-pad the full tensor to a window-divisible height, then shard
+before the model forward pass, and finally gather and unpad the outputs.
+
+#### Padding constraint for domain parallel
+
+When `domain > 1`, the padded image height must satisfy:
+
+```
+H_padded % (domain × local_window_size × product_of_strides) == 0
+```
+
+For WXFormer with `local_window_size: 10` and `cross_embed_strides: [2, 2, 2, 2]`
+(product = 16), the constraint is `H_padded % (domain × 160) == 0`. Set `pad_lat`
+in `padding_conf` so that `image_height + sum(pad_lat)` meets this requirement. For
+example, with `domain: 2` and `image_height: 640`, `pad_lat: [160, 160]` gives
+`H_padded = 960`, `960 % 320 = 0`.
+
+#### Data sharding and rank layout (the sampler contract)
+
+The dataset sampler must shard samples over the **data-parallel** dimension
+only, never over the global rank. Ranks that differ only in their tensor- or
+domain-parallel coordinate must receive the **same** batch:
+
+- **TP peers** compute partial outputs of the same activation; the row-parallel
+  `all_reduce` sums them. If TP peers get different samples, the sum mixes
+  partial outputs of different inputs, producing garbage activations. Worse, the
+  replicated (non-TP) parameters then receive different gradients on each TP
+  rank, and since nothing syncs across the tp dimension, the replicas silently
+  drift apart.
+- **Domain peers** hold different latitude bands of the same sample; the halo
+  exchange passes boundary rows between them. Different samples per domain rank
+  corrupt every halo.
+
+`init_device_mesh` arranges ranks row-major over `(dp, tp, domain)` with dp
+outermost and domain innermost (`DomainParallelManager` uses the same layout:
+domain groups are consecutive ranks). For global rank `g`:
+
+```
+dp_rank = g // (tensor × domain)
+dp_size = world_size // (tensor × domain)
+```
+
+`train_gen2.py` computes this via `credit.parallel.mesh.data_parallel_coords`
+and passes `dp_rank` / `dp_size` to the dataloader. Two further rules follow:
+
+1. **The sampler seed must be identical on every rank.** `DistributedSampler`
+   has each rank take its slice of one shared permutation; per-rank seeds make
+   each rank permute differently, silently duplicating and dropping samples.
+   Per-epoch variation comes from `sampler.set_epoch(epoch)` (the gen2 trainer
+   calls this), not from the seed.
+2. **Model RNG (dropout etc.) is seeded by `dp_rank`, not the global rank**, so
+   TP/domain peers generate identical masks while dp replicas still differ.
+
+If you write a new entry point or trainer that supports the `parallelism:`
+block, reuse `data_parallel_coords` — passing the global rank/world_size into a
+dataloader is correct only when `tensor: 1` and `domain: 1`.
+
+#### Common configurations
+
+| Mode | Config | GPUs | When to use |
+|------|--------|------|-------------|
+| FSDP2 only | `data: fsdp2, tensor: 1, domain: 1` | any | Default for large models |
+| DDP | `data: ddp, tensor: 1, domain: 1` | any | Small models, debugging |
+| Domain + DDP | `data: ddp, tensor: 1, domain: 2` | 4+ | Spatial sharding with data parallel |
+| FSDP2 + domain | `data: fsdp2, tensor: 1, domain: 2` | 4+ | Very large spatial resolution |
+| FSDP2 + TP | `data: fsdp2, tensor: 2, domain: 1` | 4+ | Reduce activation memory |
+| TP + domain | `data: none, tensor: 2, domain: 2` | 4 | Maximum memory reduction |
+
+#### Submitting a parallel job
+
+`credit submit` detects the `parallelism:` block and generates a `torchrun` launch
+automatically. No extra flags are needed:
+
+```bash
+credit submit --cluster derecho -c config.yml --gpus 4
+```
+
+The generated script uses `torchrun --standalone --nproc-per-node=4`. For multi-node
+runs, set `nodes: 2` (or more) in the `pbs:` block and `credit submit` handles the
+`--nnodes` and `--rdzv` arguments.
+
+#### Multi-node launcher (derecho)
+
+For multi-node derecho jobs, `credit submit` offers two launchers via `--launcher`:
+
+- `mpiexec` (default) — launches one `python` process per GPU under cray-mpich; MPI's
+  PMI environment variables tell each rank its identity.
+- `pbsdsh` — spawns one `torchrun` per node with PBS Pro's native task launcher
+  (no MPI process management), and runs NCCL over the `libfabric` module. Rank identity
+  comes from torchrun (`LOCAL_RANK`/`RANK`/`WORLD_SIZE`).
+
+```bash
+# Default (mpiexec)
+credit submit --cluster derecho -c config.yml --nodes 2
+
+# pbsdsh + torchrun, NCCL over libfabric
+credit submit --cluster derecho -c config.yml --nodes 2 --launcher pbsdsh
+```
+
+Both launchers apply to every `--mode` (`train`, `preprocess`, `rollout`, `realtime`) —
+each mode requests `select=<nodes>` and launches across all of them. Single-node jobs always
+use `torchrun --standalone` regardless of `--launcher`. The `pbsdsh` launcher bakes the
+fully-resolved conda/module environment into a per-node script, because pbsdsh's spawned
+shell does not inherit the job's loaded modules; NCCL uses the aws-ofi-nccl plugin over
+libfabric for inter-node communication. Use `--dry-run` to compare the two scripts.
+
+### Job submission
+
+The `credit submit` command generates a ready-to-use PBS script and optionally calls `qsub`.
+Resource settings are read from the `pbs:` section of your config (see above); CLI flags
+override them when provided.
+
+```{note}
+`pbs.nodes` applies to *every* `--mode`, not just `train`. If your config sets
+`nodes: 8` for training, `--mode rollout` / `realtime` / `preprocess` will also request
+8 nodes unless you pass `--nodes 1`. The job plan printed before submission shows the
+node count; use `--dry-run` to check the `select=` line first.
+```
+
+```bash
+# Minimal — all settings come from the pbs: block in config.yml
+credit submit --cluster derecho -c config.yml
+
+# Override specific settings on the fly
+credit submit --cluster derecho -c config.yml --nodes 2 --walltime 06:00:00
+
+# Charge a different account for this run only
+credit submit --cluster derecho -c config.yml --account NCAR0002
+
+# Preview the generated PBS script without submitting
+credit submit --cluster derecho -c config.yml --dry-run
+
+# Casper
+credit submit --cluster casper -c config.yml
+```
+
+See `credit submit --help` for the full option list.
+
+### Resuming training
+
+Wall-time limits on Casper (12 h) and Derecho mean a 70-epoch run typically needs
+multiple job submissions. Two options:
+
+#### Option A — chain jobs upfront with `--chain N`
+
+Submit all jobs at once before training starts. PBS `afterok` dependencies ensure each
+job only starts after the previous one completes successfully:
+
+```bash
+# Submit 10 back-to-back jobs (job 1 fresh, jobs 2–10 auto-reload)
+credit submit --cluster derecho -c config.yml --chain 10
+
+# Same for Casper
+credit submit --cluster casper -c config.yml --chain 10
+```
+
+If you estimate ~5 epochs per 12 h wall time and need 70 epochs total, `--chain 14`
+covers the full run without any manual resubmission.
+
+Use `--dry-run` to preview all scripts before submitting:
+
+```bash
+credit submit --cluster derecho -c config.yml --chain 10 --dry-run
+```
+
+#### Option B — manual reload with `--reload`
+
+Submit one job at a time. After each job completes, resubmit with `--reload`:
+
+```bash
+# First job
+credit submit --cluster derecho -c config.yml
+
+# Every subsequent job
+credit submit --cluster derecho -c config.yml --reload
+```
+
+#### Restarting a failed chain
+
+If the cluster kills a job mid-run (preemption, node failure, etc.), the remaining
+`afterok` jobs in the chain are automatically cancelled by PBS. To restart from the
+last good checkpoint, combine `--reload` and `--chain`:
+
+```bash
+# Resume and re-queue 5 more jobs from the latest checkpoint
+credit submit --cluster derecho -c config.yml --reload --chain 5
+```
+
+Job 1 picks up from the checkpoint; jobs 2–5 are chained behind it with `afterok`.
+The epoch counter stays continuous because `reload_epoch: True` always reads the
+next epoch from the checkpoint file.
+
+Both options write `<save_loc>/config_reload.yml` with these five fields patched
+automatically — no manual config editing required:
+
+```yaml
+load_weights: True
+load_optimizer: True
+load_scaler: True
+load_scheduler: True
+reload_epoch: True   # auto-detects next epoch from checkpoint
+```
+
+`reload_epoch: True` causes the trainer to read the epoch from the checkpoint and set
+`start_epoch = checkpoint_epoch + 1`, so the epoch counter is always continuous.

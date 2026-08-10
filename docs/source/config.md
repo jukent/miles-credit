@@ -10,8 +10,10 @@ This document provides detailed instructions on configuring `configuration.yml` 
 
 **Key Topics Covered:**  
 - Understanding and modifying `configuration.yml`  
-- Default values and expected parameter ranges  
-- Common pitfalls and troubleshooting  
+- Standard Configuration Values and Recommendations
+- Best Practices and troubleshooting  
+
+Summary tables are included at the end of each subsection.
 
 ---
 
@@ -74,7 +76,7 @@ save_loc_diagnostic: '/path/to/diagnostic_data/'
 
 - **Diagnostic variables** are used for evaluation but **not directly predicted** by the model.  
 
-#### Periodic & Static Forcing  
+### Periodic & Static Forcing  
 
 ```yaml
 forcing_variables: ['TSI', 'SST']
@@ -86,9 +88,6 @@ save_loc_static: '/path/to/static_data.nc'
 
 - **Periodic forcing**: Should cover an entire leap year (e.g., 366 days for an hourly model).  
 - **Static variables**: Must be normalized **by the user** before use.  
-
-
-You're right again—these options are **critical for data standardization and conservation enforcement**, so they should be fully documented. Below is an **expanded section** that provides detailed explanations.  
 
 ---
 
@@ -142,7 +141,7 @@ Both `mean_path` and `std_path` should store **1D variables indexed by level**:
 
 ---
 
-## Summary of Key Recommendations  
+### Summary of Key Physics & Normalization Recommendations  
 
 | Parameter | Required For | Notes |
 |-----------|-------------|-------|
@@ -294,14 +293,15 @@ dataset_type: ERA5_MultiStep_Batcher
 - **Options**:  
   - `ERA5_MultiStep_Batcher`  
   - `ERA5_and_Forcing_MultiStep` 
-  - `MultiprocessingBatcherPrefetch` (*experimental*)
-  - `MultiprocessingBatcher`  
+  - `ERA5_and_Forcing_SingleStep`
+  - `Ocean_Tensor_Batcher`
+  - `Ocean_MultiStep_Batcher`
 - The **default (`ERA5_MultiStep_Batcher`) is recommended** for efficient parallel data loading.  
-- `MultiprocessingBatcherPrefetch` is *experimental* and you may run into weird issues.
+
 
 ---
 
-## Summary of Key Recommendations  
+### Summary of Key Data Processing Recommendations  
 
 | Parameter | Recommended Setting | Notes |
 |-----------|---------------------|-------|
@@ -323,7 +323,7 @@ The `trainer` section controls how CREDIT handles **GPU parallelism, gradient up
 
 ```yaml
 trainer:
-    type: era5 # era5 or conus404 (in development)
+    type: era5-gen1 # era5-gen1, era5-gen2, or conus404
     mode: none  # Options: "none" (single GPU), "fsdp" (fully sharded), "ddp" (distributed)
 ```
 
@@ -436,7 +436,7 @@ update_learning_rate: False
 
 ---
 
-## Summary of Key Recommendations  
+### Summary of Key Hardware Utilization Recommendations  
 
 | Parameter | Recommended Setting | Notes |
 |-----------|---------------------|-------|
@@ -626,7 +626,7 @@ prefetch_factor: 4
 
 ---
 
-## Summary of Key Recommendations  
+### Summary of Key Training Strategy Recommendations  
 
 | Parameter | Recommended Setting | Notes |
 |-----------|---------------------|-------|
@@ -666,11 +666,6 @@ surface_channels: 7
 
 
 Here's an **expanded and structured section** detailing the **model configuration**, including explanations of **architecture choices, spatial resolution, patch embeddings, attention mechanisms, and normalization techniques**.  
-
----
-## Model Configuration  
-
-The `model` section defines the **architecture and input structure** for CREDIT.  
 
 ### Selecting a Model Architecture  
 
@@ -817,7 +812,7 @@ interp: True
 
 ---
 
-## Summary of Key Recommendations  
+### Summary of Key Model Recommendations  
 
 | Parameter | Recommended Setting | Notes |
 |-----------|---------------------|-------|
@@ -854,7 +849,7 @@ padding_conf:
 💡 *Padding ensures continuity at boundaries, preventing artifacts in global simulations.*  
 
 ---
-## Summary of Key Recommendations  
+### Summary of Key Padding Recommendations  
 
 | Parameter | Recommended Setting | Notes |
 |-----------|---------------------|-------|
@@ -1112,7 +1107,7 @@ global_energy_fixer:
 
 ---
 
-## Summary of Key Conservation Fixers  
+### Summary of Key Conservation Fixers 
 
 | Fixer | Purpose | Key Variables |
 |--------|---------|--------------|
@@ -1150,7 +1145,8 @@ training_loss: "mse"
   - `"logcosh"` → **Log-Cosh Loss** (similar to Huber, smooths large errors).  
   - `"xtanh"` → Custom loss using hyperbolic tangent.  
   - `"xsigmoid"` → Custom loss using sigmoid transformation.  
-  - `"KCRPS"` → bias corrected CRPS for ensemble training
+  - `"KCRPS"` → bias corrected CRPS for ensemble training.
+  - `"almost-fair-crps"`→ bias-corrected CRPS for ensemble training with small ensembles.
 
 💡 *`mse` is recommended for smooth loss surfaces, while `huber` or `logcosh` are better for handling outliers.*  
 
@@ -1227,7 +1223,7 @@ variable_weights:
 
 ---
 
-## Summary of Key Recommendations  
+### Summary of Key Loss Recommendations  
 
 | Parameter | Recommended Setting | Notes |
 |-----------|---------------------|-------|
@@ -1361,7 +1357,7 @@ climatology: '/path/to/climatology.nc'
 
 ---
 
-## Summary of Key Recommendations  
+### Summary of Key Prediction Recommendations  
 
 | Parameter | Recommended Setting | Notes |
 |-----------|---------------------|-------|
@@ -1389,7 +1385,8 @@ pbs:
 ```
 
 - **`nodes`, `ncpus`, `ngpus`**: Adjust based on compute resources.  
-- **For Casper**: Change `queue: 'casper'` and specify `gpu_type: 'v100'`.  
+- **For Casper**: Change `queue: 'casper'`. `gpu_type` is optional — omit it to run on any
+  available NVIDIA GPGPU (usually a shorter queue wait), or pin a model with e.g. `gpu_type: 'v100'`.
 
 ---
 

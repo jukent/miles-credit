@@ -1,5 +1,4 @@
 import os
-import gc
 import sys
 import yaml
 import logging
@@ -12,18 +11,16 @@ from collections import defaultdict
 
 # ---------- #
 # Numerics
-from datetime import datetime, timedelta
+from datetime import datetime
 import xarray as xr
 import numpy as np
-import pandas as pd
-import cftime
 
 # ---------- #
 import torch
 
 # ---------- #
 # credit
-from credit.models import load_model
+from credit.models import load_model, load_model_name
 from credit.seed import seed_everything
 from credit.distributed import get_rank_info
 
@@ -41,8 +38,8 @@ from credit.forecast import load_forecasts
 from credit.distributed import distributed_model_wrapper, setup
 from credit.models.checkpoint import load_model_state, load_state_dict_error_handler
 from credit.parser import credit_main_parser, predict_data_check
-from credit.output import load_metadata, make_xarray, save_netcdf_increment
-from credit.postblock import GlobalMassFixer, GlobalWaterFixer, GlobalEnergyFixer
+from credit.output import load_metadata
+from credit.postblock.gen1 import GlobalMassFixer, GlobalWaterFixer, GlobalEnergyFixer
 
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")
@@ -51,7 +48,7 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
 
-def predict(rank, world_size, conf, p):
+def predict(rank, world_size, conf, p, model_name=None):
     # setup rank and world size for GPU-based rollout
     if conf["predict"]["mode"] in ["fsdp", "ddp"]:
         setup(rank, world_size, conf["predict"]["mode"])
@@ -206,25 +203,33 @@ def predict(rank, world_size, conf, p):
     distributed = conf["predict"]["mode"] in ["ddp", "fsdp"]
     # ================================================================================ #
     if conf["predict"]["mode"] == "none":
-        model = load_model(conf, load_weights=True).to(device)
+        print("bingo")
+        if model_name:
+            model = load_model_name(conf, model_name, load_weights=True).to(device)
+        else:
+            model = load_model(conf, load_weights=True).to(device)
 
     elif conf["predict"]["mode"] == "ddp":
         model = load_model(conf).to(device)
         # if conf["trainer"].get("compile", False):
         #     model = torch.compile(model)
         model = distributed_model_wrapper(conf, model, device)
-        ckpt = os.path.join(save_loc, "checkpoint.pt")
+        # Use specific model checkpoint if provided, otherwise default to checkpoint.pt
+        ckpt_name = model_name if model_name else "checkpoint.pt"
+        ckpt = os.path.join(save_loc, ckpt_name)
         checkpoint = torch.load(ckpt, map_location=device)
-        load_msg = model.module.load_state_dict(
-            checkpoint["model_state_dict"], strict=False
-        )
+        load_msg = model.module.load_state_dict(checkpoint["model_state_dict"], strict=False)
         load_state_dict_error_handler(load_msg)
 
     elif conf["predict"]["mode"] == "fsdp":
-        model = load_model(conf, load_weights=True).to(device)
+        if model_name:
+            model = load_model_name(conf, model_name, load_weights=True).to(device)
+        else:
+            model = load_model(conf, load_weights=True).to(device)
         model = distributed_model_wrapper(conf, model, device)
         # Load model weights (if any), an optimizer, scheduler, and gradient scaler
-        model = load_model_state(conf, model, device)
+        if not model_name:  # Only use load_model_state if not using specific model
+            model = load_model_state(conf, model, device)
     # ================================================================================ #
 
     model.eval()
@@ -239,10 +244,7 @@ def predict(rank, world_size, conf, p):
     metrics_results = defaultdict(list)
 
     # Set up the diffusion and pole filters
-    if (
-        "use_laplace_filter" in conf["predict"]
-        and conf["predict"]["use_laplace_filter"]
-    ):
+    if "use_laplace_filter" in conf["predict"] and conf["predict"]["use_laplace_filter"]:
         dpf = Diffusion_and_Pole_Filter(
             nlat=conf["model"]["image_height"],
             nlon=conf["model"]["image_width"],
@@ -269,11 +271,7 @@ def predict(rank, world_size, conf, p):
                     # combine x and x_surf
                     # input: (batch_num, time, var, level, lat, lon), (batch_num, time, var, lat, lon)
                     # output: (batch_num, var, time, lat, lon), 'x' first and then 'x_surf'
-                    x = (
-                        concat_and_reshape(batch["x"], batch["x_surf"])
-                        .to(device)
-                        .float()
-                    )
+                    x = concat_and_reshape(batch["x"], batch["x_surf"]).to(device).float()
                 else:
                     # no x_surf
                     x = reshape_only(batch["x"]).to(device).float()
@@ -285,9 +283,7 @@ def predict(rank, world_size, conf, p):
             # add forcing and static variables (regardless of fcst hours)
             if "x_forcing_static" in batch:
                 # (batch_num, time, var, lat, lon) --> (batch_num, var, time, lat, lon)
-                x_forcing_batch = (
-                    batch["x_forcing_static"].to(device).permute(0, 2, 1, 3, 4).float()
-                )
+                x_forcing_batch = batch["x_forcing_static"].to(device).permute(0, 2, 1, 3, 4).float()
 
                 # concat on var dimension
                 x = torch.cat((x, x_forcing_batch), dim=1)
@@ -306,14 +302,10 @@ def predict(rank, world_size, conf, p):
                 y_diag_batch = batch["y_diag"].to(device).permute(0, 2, 1, 3, 4)
                 y = torch.cat((y, y_diag_batch), dim=1).to(device).float()
 
-            save_location = os.path.join(
-                    os.path.expandvars(conf["save_loc"]), "init_times"
-                )
-            os.makedirs(
-                    save_location, exist_ok=True
-                )
-            torch.save(x, f'{save_location}/init_condition_tensor_{init_datetime_str}.pth')
-            print('init cond saved to:' f'{save_location}/init_condition_tensor_{init_datetime_str}.pth') 
+            save_location = os.path.join(os.path.expandvars(conf["save_loc"]), "init_times")
+            os.makedirs(save_location, exist_ok=True)
+            torch.save(x, f"{save_location}/init_camulator_condition_tensor_{init_datetime_str}.pth")
+            print(f"init cond saved to:{save_location}/init_camulator_condition_tensor_{init_datetime_str}.pth")
             break
     return 1
 
@@ -323,6 +315,8 @@ if __name__ == "__main__":
     parser = ArgumentParser(description=description)
     # -------------------- #
     # parser args: -c, -l, -w
+    # example usage:
+    # torchrun /glade/derecho/scratch/wchapman/miles_branchs/pretrain_CESM_Spatial_PS_WXmod_pxshf_LR/applications/Make_Climate_Initial_Conditions.py -c /glade/derecho/scratch/wchapman/miles_branchs/pretrain_CESM_Spatial_PS_WXmod_pxshf_LR/be21_coupled-v2025.2.0_small.yml
     parser.add_argument(
         "-c",
         dest="model_config",
@@ -384,6 +378,13 @@ if __name__ == "__main__":
         help="Number of CPU workers to use per GPU",
     )
 
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default=None,
+        help="Optional model checkpoint name (e.g., checkpoint.pt00091.pt). Defaults to checkpoint.pt",
+    )
+
     # parse
     args = parser.parse_args()
     args_dict = vars(args)
@@ -394,6 +395,7 @@ if __name__ == "__main__":
     subset = int(args_dict.pop("subset"))
     number_of_subsets = int(args_dict.pop("no_subset"))
     num_cpus = int(args_dict.pop("num_cpus"))
+    model_name = args_dict.pop("model_name")
 
     # Set up logger to print stuff
     root = logging.getLogger()
@@ -412,17 +414,13 @@ if __name__ == "__main__":
 
     # ======================================================== #
     # handling config args
-    conf = credit_main_parser(
-        conf, parse_training=False, parse_predict=True, print_summary=False
-    )
+    conf = credit_main_parser(conf, parse_training=False, parse_predict=True, print_summary=False)
     predict_data_check(conf, print_summary=False)
     # ======================================================== #
 
     # create a save location for rollout
     # ---------------------------------------------------- #
-    assert (
-        "save_forecast" in conf["predict"]
-    ), "Please specify the output dir through conf['predict']['save_forecast']"
+    assert "save_forecast" in conf["predict"], "Please specify the output dir through conf['predict']['save_forecast']"
 
     forecast_save_loc = conf["predict"]["save_forecast"]
     os.makedirs(forecast_save_loc, exist_ok=True)
@@ -450,7 +448,6 @@ if __name__ == "__main__":
             launch_script_mpi(config, script_path)
         sys.exit()
 
-
     if number_of_subsets > 0:
         forecasts = load_forecasts(conf)
         if number_of_subsets > 0 and subset >= 0:
@@ -465,9 +462,9 @@ if __name__ == "__main__":
 
     with mp.Pool(num_cpus) as p:
         if conf["predict"]["mode"] in ["fsdp", "ddp"]:  # multi-gpu inference
-            _ = predict(world_rank, world_size, conf, p=p)
+            _ = predict(world_rank, world_size, conf, p=p, model_name=model_name)
         else:  # single device inference
-            _ = predict(0, 1, conf, p=p)
+            _ = predict(0, 1, conf, p=p, model_name=model_name)
 
     # Ensure all processes are finished
     p.close()

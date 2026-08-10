@@ -12,6 +12,8 @@ CREDIT is a machine learning-based research platform for understanding the best 
 
 CREDIT enables users to train, run, and evaluate AI-based numerical weather and climate models. This documentation will guide you through installation, configuration, training, inference, evaluation, and extending the system with custom datasets and models.
 
+**New here?** Start with the `Quickstart <quickstart.html>`_ — it gets you from zero to a running training job in under 10 minutes.
+
 **What you'll find here:**
 
 - How to install CREDIT from source
@@ -27,6 +29,7 @@ If you encounter issues or have suggestions, please open an issue on our GitHub 
    :maxdepth: 2
    :caption: Getting Started
 
+   Quickstart <quickstart.md>
    Getting Started <getting-started.md>
    Installing CREDIT from source <installation.md>
 
@@ -41,26 +44,33 @@ If you encounter issues or have suggestions, please open an issue on our GitHub 
    :caption: Training and Inference
 
    Training a Model <Training.md>
+   Monitoring with TensorBoard <tensorboard.md>
    Running Inference <Inference.md>
+   Forecast API Server <serve.md>
+   AI Agent <agent.md>
    Evaluation and Metrics <Evaluation.md>
+   Verification Metrics <Metrics.md>
    Ensemble Training <Ensembles.md>
    Ensemble Inference <EnsemblesInference.md>
    Working with Loss Functions <Losses.md>
+   Gen 1 Losses <Losses_gen1.md>
 
 .. toctree::
    :maxdepth: 2
    :caption: Contributing
 
-   Contributing <contrib.rst>
+   Contributing <contrib.md>
 
 .. toctree::
    :maxdepth: 1
-   :caption: Adding New Models and Datasets (Coming Soon)
+   :caption: Adding New Models and Datasets
 
    Supported Model Architectures <Model_Architectures.md>
    Post Blocks <postblock.md>
    Dataset Structure <DataSets.md>
-
+   Data Pipeline for Downscaling <downscaling-pipeline.md>
+   Prepare New Dataset <prepare_new_dataset.md>
+   RAL GWC regional model <RAL-GWC-model.md> 
 ----
 
 Indices and Tables

@@ -3,7 +3,7 @@
 ## Prediction Ingredients
 Before beginning rollouts of a CREDIT model, you will need the following ingredients/files 
 available on your machine.
-1. 🌎Initial conditions for upper air and surface variables in Zarr format. If running processed ERA5 
+1. 🌎 Initial conditions for upper air and surface variables in Zarr format. If running processed ERA5 
 on Derecho or Casper, you can access the processed files at 
 `/glade/campaign/cisl/aiml/credit/era5_zarr/`. The `y_TOTAL*.zarr` and `SixHourly_y_TOTAL*.zarr` 
 are at 0.28 degree grid spacing, and `SixHourly_y_ONEdeg*.zarr` for 1 degree data.
@@ -12,7 +12,7 @@ only dynamic forcing variable is top-of-atmosphere shortwave irradiance. Pre-cal
 irradiance values integrated over 1 and 6 hour periods are available on Derecho/Casper at 
 `/glade/campaign/cisl/aiml/credit/credit_solar_nc_6h_0.25deg` and `credit_solar_nc_1h_0.25deg`. You
 can calculate top of atmosphere solar irradiance for any grid and integration time period with
-`applications/calc_global_solar.py`. If you plan to issue regular predictions, we recommend
+`credit_calc_global_solar`. If you plan to issue regular predictions, we recommend
 pre-computing solar irradiance values for a given year of inference rather than calculating on the fly.
 3. ⛰️ Static forcing files with and without normalization. These forcing files include elements like
 terrain height, land-sea mask, and land-use type. Static forcing files for the initial CREDIT models
@@ -26,7 +26,7 @@ for the mean and `std_residual_6h_1979_2018_16lev_0.25deg.nc` for the combined s
 each variable and the standard deviation of the temporal residual.
 
 ## Realtime Rollouts
-The goal of realtime inference is to launch model forecasts from GFS or ERA5 initial conditions.
+The goal of realtime inference is to launch model forecasts from GFS, GEFS, or ERA5 initial conditions.
 The `predict` section of your configuration file should contain the following fields:
 ```yaml
 predict:
@@ -45,26 +45,29 @@ It will download fields from a GFS initial condition on model levels, which are 
 on the NOAA [NOMADS](https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/) server. GDAS Analyses and
 GFS initial timesteps on model levels are also available on 
 [Google Cloud](https://console.cloud.google.com/marketplace/product/noaa-public/gfs) back to 2021.
-The `gfs_init.py` program regrids the data onto the appropriate CREDIT grid and interpolates in
-the vertical from the GFS to selected CREDIT ERA5 hybrid sigma-pressure levels. 
+The `credit_gfs_init` program regrids the data onto the appropriate CREDIT grid and interpolates in
+the vertical from the GFS to selected CREDIT ERA5 hybrid sigma-pressure levels.
 
 :::{important}                                                                          
-`gfs_init.py` requires xesmf, which depends on the [ESMF](https://github.com/esmf-org/esmf) suite 
+`credit_gfs_init` requires xesmf, which depends on the [ESMF](https://github.com/esmf-org/esmf) suite 
 and cannot be installed from PyPI. The easist way to install xesmf without messing up your CREDIT
 environment is to run `conda install -c conda-forge esmf esmpy` then `pip install xesmf` after building
 your CREDIT environment first. 
 :::
 
-Realtime rollouts are handled by `applications/rollout_realtime.py`. Update the paths in the 
-data section of the config file to point to the GFS initial conditions zarr file. `rollout_realtime.py`
+If you want to launch ensemble rollouts, you can use `credit_gefs_init` to convert raw GEFS cube sphere data
+to grids for CREDIT models. 
+
+Realtime rollouts are handled by `credit_rollout_realtime`. Update the paths in the 
+data section of the config file to point to the GFS initial conditions zarr file. `credit_rollout_realtime`
 only outputs one forecast at a time.
 
 ## Rollout to netCDF for ERA5 initiated forecasts
-`rollout_to_netcdf.py` enables you to generate forecasts for many initialization times using 
-processed ERA5 data as initial conditions. It can be run either in serial or parallel mode with
-both single node and multi node support (MPI-enabled PyTorch required). 
+`credit rollout` generates forecasts for many initialization times using processed ERA5 data as
+initial conditions. It supports deterministic and ensemble rollouts, serial and parallel modes,
+single and multi-node execution.
 
-To run `rollout_to_netcdf.py` include the following section in your config file.
+Add the following section to your config file:
 
 ```yaml
 predict:
@@ -79,14 +82,47 @@ predict:
                              # duration should be divisible by the number of GPUs
                              # (e.g., duration: 384 for 365-day rollout using 32 GPUs)
         days: 10             # forecast lead time as days (1 means 24-hour forecast)
+    ensemble_size: 1         # set > 1 to save ensemble members to NetCDF
 ```
 
-To submit the rollout script as a PBS job, use `python rollout_to_netcdf.py -l 1 -c <config file>`.
+### Running locally
 
-To issue predictions on multiple GPUs on a single node:
-`torchrun rollout_to_netcdf.py -c <confg file>`
+```bash
+# Deterministic rollout (reads ensemble_size from config)
+credit rollout -c config.yml
 
-For multi-node rollouts with MPI (MPI-enabled PyTorch required):
+# Ensemble rollout — override ensemble_size from the CLI
+credit rollout -c config.yml --ensemble-size 50
+
+# Multi-GPU on a single node
+credit rollout -c config.yml -m ddp
+```
+
+### Submitting PBS jobs
+
+Use `credit submit` to submit rollout jobs to the cluster. The `--rollout` flag switches from
+training submission to parallel rollout submission. `--jobs N` splits init times across N
+independent PBS jobs (all start at once, no afterok chain).
+
+```bash
+# Submit 10 parallel rollout jobs on Casper (deterministic or ensemble — set by config)
+credit submit --cluster casper -c config.yml --rollout --jobs 10
+
+# Override ensemble size at submission time
+credit submit --cluster casper -c config.yml --rollout --jobs 10 --gpus 1
+
+# Dry run — inspect the PBS scripts before submitting
+credit submit --cluster casper -c config.yml --rollout --jobs 10 --dry-run
+```
+
+`--jobs` controls how many PBS nodes split the init-time work. `ensemble_size` in the config
+(or `--ensemble-size` at the CLI) controls how many ensemble members are run per init time.
+These are independent settings.
+
+### Multi-node rollout (MPI)
+
+For MPI-enabled PyTorch installations:
+
 ```bash
 nodes=( $( cat $PBS_NODEFILE ) )
 head_node=${nodes[0]}
@@ -94,10 +130,10 @@ head_node_ip=$(ssh $head_node hostname -i | awk '{print $1}')
 export NUM_RANKS=32
 MASTER_ADDR=$head_node_ip
 MASTER_PORT=1234
-mpiexec -n $NUM_RANKS -ppn 4 --cpu-bind none python rollout_to_netcdf.py -c <config file>
+mpiexec -n $NUM_RANKS -ppn 4 --cpu-bind none python applications/rollout_to_netcdf_v2.py -c config.yml
 ```
 ## Interpolation to constant pressure and height above ground levels
-Both `rollout_realtime.py` and `rollout_to_netcdf.py` support vertical interpolation to constant
+Both `credit_rollout_realtime` and `credit_rollout_to_netcdf` support vertical interpolation to constant
 pressure and constant height above ground level (AGL) levels from the hybrid sigma-pressure levels
 used by most models in CREDIT. To enable interpolation, add the following lines to your config
 file in the predict section
@@ -157,3 +193,112 @@ predict:
     shuffle: True
     chunksizes: [1, *height, *width]
 ```
+
+---
+
+## Running Rollouts with the v2 Data Schema
+
+If you trained with `trainer.type: era5-gen2`, use the v2 rollout commands.
+The same YAML config used for training drives inference — no separate rollout config is needed.
+
+### Batch rollout to NetCDF
+
+`credit rollout` steps the model forward over a set of historical initial conditions
+and writes one NetCDF file per forecast:
+
+```bash
+credit rollout -c config/wxformer_1dg_6hr_v2.yml
+```
+
+To run on multiple GPUs pass `--mode ddp`:
+
+```bash
+credit rollout -c config/wxformer_1dg_6hr_v2.yml --mode ddp
+```
+
+The `predict` block in your config controls which dates are run and where output goes:
+
+```yaml
+predict:
+    mode: ddp           # none | ddp
+    batch_size: 4       # initial conditions per GPU per batch
+    ensemble_size: 1    # > 1 enables ensemble inference (requires ensemble model)
+    forecasts:
+        type: "custom"
+        start_year: 2020
+        start_month: 1
+        start_day: 1
+        start_hours: [0, 12]   # UTC hours to initialise each day
+        duration: 1             # forecast length in days
+        days: 1                 # number of days to run from start date
+    metadata: '/path/to/credit/metadata/era5.yaml'
+    save_forecast: '/glade/derecho/scratch/$USER/CREDIT_runs/my_run'
+    use_laplace_filter: False
+```
+
+Output files land in `save_forecast/`. Filename format is
+`<YYYY><MM><DD><HH>Z_<lead_hours>h.nc`.
+
+### Realtime forecast from a single init time
+
+`credit realtime` runs one forecast from a user-specified initialisation time,
+writing output as it steps (useful for operational or near-realtime use):
+
+```bash
+credit realtime -c config/wxformer_1dg_6hr_v2.yml \
+    --init-time 2024-01-15T00 \
+    --steps 40
+```
+
+`--steps 40` = 40 × 6 h = 10-day forecast. Output lands in `predict.save_forecast`.
+
+To override the output directory:
+
+```bash
+credit realtime -c config.yml --init-time 2024-06-01T12 --steps 40 \
+    --save-dir /tmp/test_forecast
+```
+
+### Quick sanity-check after training
+
+The fastest way to verify a freshly trained model produces sensible output:
+
+```bash
+# Plot 2m temperature in physical units (Kelvin) — recommended starting point
+credit plot -c config/wxformer_1dg_6hr_v2.yml --field VAR_2T --denorm
+
+# Multiple fields at once
+credit plot -c config/wxformer_1dg_6hr_v2.yml --field VAR_2T SP --denorm
+
+# 3D variable: temperature at level index 5 (pressure-level ordering)
+credit plot -c config/wxformer_1dg_6hr_v2.yml --field temperature --level 5 --denorm
+
+# Point at a specific checkpoint or date
+credit plot -c config/wxformer_1dg_6hr_v2.yml --field VAR_2T \
+    --checkpoint /glade/derecho/scratch/$USER/CREDIT_runs/my_run/checkpoint.pt \
+    --sample-date 2020-06-15T00 --denorm
+```
+
+Each PNG is saved to `<save_loc>/plots/` and shows **truth | prediction | difference**
+as a global map.
+
+`--denorm` converts outputs from normalised (σ) units to physical units using the
+mean and std files from your config — e.g. Kelvin for temperature, Pascals for surface
+pressure. Without `--denorm` the colourbar is in standard-deviation units, which is
+useful for diagnosing normalisation issues but harder to interpret at a glance.
+
+**What to look for:**
+
+| Symptom | Likely cause |
+|---------|-------------|
+| Loss > 100 or NaN | Normalisation broken — check mean/std paths |
+| Prediction is uniform (no structure) | Too few epochs or learning rate too high |
+| Tiling / grid artefacts in prediction | Normal at early epochs for window-based models; disappears with training |
+| Difference panel is smooth and small | Training is going well |
+
+### NCAR data paths
+
+The built-in v2 configs already point to the shared ERA5 archive at
+`/glade/campaign/cisl/aiml/ksha/CREDIT_data/` and the shared metadata at
+`/glade/u/home/akn7/miles-credit/credit/metadata/era5.yaml`.
+No path edits are needed for NCAR users.

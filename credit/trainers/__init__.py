@@ -1,56 +1,105 @@
 import copy
+import importlib
 import logging
-
-# Import trainer classes
-from credit.trainers.trainerERA5 import Trainer as TrainerERA5
-from credit.trainers.trainerERA5_Diffusion import Trainer as TrainerERA5_Diffusion
-from credit.trainers.trainerERA5_ensemble import Trainer as TrainerEnsemble
-from credit.trainers.trainer404 import Trainer as Trainer404
-from credit.trainers.ic_optimization import Trainer as TrainerIC
 
 logger = logging.getLogger(__name__)
 
-
-# Define trainer types and their corresponding classes
-trainer_types = {
-    "era5": (
-        TrainerERA5,
+# Registry: trainer_type -> (module_path, class_name, description)
+_TRAINER_REGISTRY = {
+    "era5-gen1": (
+        "credit.trainers.trainerERA5gen1",
+        "TrainerERA5Gen1",
         "Loading a single or multi-step trainer for the ERA5 dataset that uses gradient accumulation on forecast lengths > 1.",
     ),
+    "era5": (  # backward-compat alias for era5-gen1
+        "credit.trainers.trainerERA5gen1",
+        "TrainerERA5Gen1",
+        "Loading a single or multi-step trainer for the ERA5 dataset that uses gradient accumulation on forecast lengths > 1.",
+    ),
+    "gen2": (
+        "credit.trainers.trainer_gen2",
+        "TrainerERA5Gen2",
+        "Gen2 trainer for the new nested data schema with preblock-assembled batches. forecast_len=1 means 1 step.",
+    ),
+    "era5-gen2": (  # backward-compat alias for gen2
+        "credit.trainers.trainer_gen2",
+        "TrainerERA5Gen2",
+        "Gen2 trainer for the new nested data schema with preblock-assembled batches. forecast_len=1 means 1 step.",
+    ),
     "era5-diffusion": (
-        TrainerERA5_Diffusion,
+        "credit.trainers.trainerERA5_Diffusion",
+        "TrainerERA5Diffusion",
         "Loading a single or multi-step trainer for the ERA5 dataset that uses gradient accumulation on forecast lengths > 1.",
     ),
     "era5-ensemble": (
-        TrainerEnsemble,
+        "credit.trainers.trainerERA5_ensemble",
+        "TrainerERA5Ensemble",
         "Loading a single or multi-step trainer for the ERA5 dataset for parallel computation of the CRPS loss.",
     ),
     "cam": (
-        TrainerERA5,
+        "credit.trainers.trainerERA5gen1",
+        "TrainerERA5Gen1",
         "Loading a single or multi-step trainer for the CAM dataset that uses gradient accumulation on forecast lengths > 1.",
     ),
-    "ic-opt": (TrainerIC, "Loading an initial condition optimizer training class"),
-    "conus404": (Trainer404, "Loading a standard trainer for the CONUS404 dataset."),
+    "ic-opt": (
+        "credit.trainers.ic_optimization",
+        "TrainerIC",
+        "Loading an initial condition optimizer training class",
+    ),
+    "conus404": (
+        "credit.trainers.trainer_downscaling",
+        "TrainerDownscaling",
+        "Loading a standard trainer for the CONUS404 dataset.",
+    ),
+    "standard-les": (
+        "credit.trainers.trainerLES",
+        "TrainerLES",
+        "Loading a single-step LES trainer",
+    ),
+    "standard-wrf": (
+        "credit.trainers.trainerWRF",
+        "TrainerWRF",
+        "Loading a single-step WRF trainer",
+    ),
+    "multi-step-wrf": (
+        "credit.trainers.trainerWRF_multi",
+        "TrainerWRFMulti",
+        "Loading a multi-step WRF trainer",
+    ),
+    "samudra": (
+        "credit.trainers.trainer_om4_samudra",
+        "TrainerSamudra",
+        "Loading a single or multi-step trainer for the Samudra OM4 dataset that uses gradient accumulation on forecast lengths > 1.",
+    ),
 }
 
 
-def load_trainer(conf, load_weights=False):
+# Public alias for backward compatibility and test introspection
+trainer_types = _TRAINER_REGISTRY
+
+
+def load_trainer(conf):
     conf = copy.deepcopy(conf)
     trainer_conf = conf["trainer"]
 
     if "type" not in trainer_conf:
-        msg = f"You need to specify a trainer 'type' in the config file. Choose from {list(trainer_types.keys())}"
+        msg = f"You need to specify a trainer 'type' in the config file. Choose from {list(_TRAINER_REGISTRY.keys())}"
         logger.warning(msg)
         raise ValueError(msg)
 
     trainer_type = trainer_conf.pop("type")
 
-    if trainer_type in trainer_types:
-        trainer, message = trainer_types[trainer_type]
-        logger.info(message)
-        return trainer
-
-    else:
+    if trainer_type not in _TRAINER_REGISTRY:
         msg = f"Trainer type {trainer_type} not supported. Exiting."
         logger.warning(msg)
         raise ValueError(msg)
+
+    module_path, class_name, message = _TRAINER_REGISTRY[trainer_type]
+    logger.info(message)
+    try:
+        module = importlib.import_module(module_path)
+        return getattr(module, class_name)
+    except (ImportError, Exception) as e:
+        msg = f"Could not import trainer '{class_name}' from '{module_path}': {e}"
+        logger.warning(msg)
+        raise ImportError(msg) from e

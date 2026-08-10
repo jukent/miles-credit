@@ -11,7 +11,7 @@ import pandas as pd
 from torch.utils.data import IterableDataset
 from credit.trainers.base_trainer import BaseTrainer
 from credit.data import concat_and_reshape, reshape_only
-from credit.postblock import GlobalMassFixer, GlobalWaterFixer, GlobalEnergyFixer
+from credit.postblock.gen1 import GlobalMassFixer, GlobalWaterFixer, GlobalEnergyFixer
 from torch.optim.lr_scheduler import CosineAnnealingLR  # , CosineAnnealingWarmRestarts
 from credit.output import load_metadata, make_xarray
 from credit.transforms import Normalize_ERA5_and_Forcing
@@ -226,7 +226,7 @@ class TimeStepper:
         return self.dataset[0]  # __getitem__ uses forecast_step_counts[0] internally
 
 
-class Trainer(BaseTrainer):
+class TrainerIC(BaseTrainer):
     def __init__(self, model: torch.nn.Module, rank: int):
         """
         Trainer class for handling the training, validation, and checkpointing of models.
@@ -310,9 +310,9 @@ class Trainer(BaseTrainer):
             # If not specified in config, use the range 1 to forecast_len
             backprop_on_timestep = list(range(0, conf["data"]["forecast_len"] + 1 + 1))
 
-        assert (
-            forecast_length <= backprop_on_timestep[-1]
-        ), f"forecast_length ({forecast_length + 1}) must not exceed the max value in backprop_on_timestep {backprop_on_timestep}"
+        assert forecast_length <= backprop_on_timestep[-1], (
+            f"forecast_length ({forecast_length + 1}) must not exceed the max value in backprop_on_timestep {backprop_on_timestep}"
+        )
 
         # update the learning rate if epoch-by-epoch updates that dont depend on a metric
         if conf["trainer"]["use_scheduler"] and conf["trainer"]["scheduler"]["scheduler_type"] == "lambda":

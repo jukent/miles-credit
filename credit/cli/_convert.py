@@ -1,0 +1,567 @@
+"""credit init and credit convert command handlers."""
+
+import argparse
+import os
+import sys
+import yaml
+
+from ._common import _prompt, _prompt_bool, _repo_root
+
+
+def _build_bridgescaler_jsons(mean_path, std_path, var_groups, pre_out, post_out, source_name="ERA5"):
+    """Convert old mean/std NetCDF files into two BridgeScaler JSON files.
+
+    Creates one JSON for the preblock (batch-dict key structure) and one for
+    the postblock (reconstructed prediction-dict structure).
+
+    Parameters
+    ----------
+    mean_path, std_path : str
+        Paths to NetCDF files with per-variable means and standard deviations.
+        3-D variables have a 'level' dimension; 2-D variables are scalars.
+    var_groups : dict
+        ``{(field_type, dim): [varname, ...]}`` — maps ("prognostic", "3d") etc.
+        to the list of variable names that belong to that group.
+    pre_out : str
+        Output path for the preblock scaler JSON.
+    post_out : str
+        Output path for the postblock scaler JSON.
+
+    Returns
+    -------
+    pre_keys : list[str]
+        Full key paths included in the preblock scaler
+        (e.g. ``"era5/prognostic/3d/temperature"``).
+    post_prog_vars : list[str]
+        Short variable names of prognostic vars in the postblock scaler.
+    """
+    import numpy as np
+    import xarray as xr
+
+    try:
+        import torch
+        from bridgescaler.distributed_tensor import DStandardScalerTensor
+        from bridgescaler import save_scaler_dict
+    except ImportError as e:
+        print(f"  WARNING: cannot build BridgeScaler JSON — {e}", file=sys.stderr)
+        print("  Falling back to era5_normalizer preblock.", file=sys.stderr)
+        return None, None
+
+    ds_mean = xr.open_dataset(mean_path)
+    ds_std = xr.open_dataset(std_path)
+    nc_vars = set(ds_mean.data_vars) & set(ds_std.data_vars)
+
+    def _make_scaler(varname, n_levels):
+        mean_vals = np.array(ds_mean[varname].values, dtype=np.float32)
+        std_vals = np.array(ds_std[varname].values, dtype=np.float32)
+        if mean_vals.ndim == 0:
+            mean_vals = mean_vals.reshape(1)
+            std_vals = std_vals.reshape(1)
+        sc = DStandardScalerTensor(channels_last=False)
+        sc.mean_x_ = torch.tensor(mean_vals, dtype=torch.float32)
+        sc.var_x_ = torch.tensor(std_vals**2, dtype=torch.float32)
+        sc.x_columns_ = list(range(len(mean_vals)))
+        sc._fit = True
+        sc.n_ = 1
+        return sc
+
+    # --- preblock dict: {"input": {source: {full_key: scaler}},
+    #                     "target": {source: {full_key: scaler}}}
+    # Must match the raw batch dict produced by the dataset. The dataset uses
+    # full-path strings as leaf keys: e.g. "ERA5/prognostic/3d/u_component_of_wind".
+    pre_input = {}  # all field types (prognostic, dynamic_forcing, static)
+    pre_target = {}  # prognostic only (model prediction targets)
+    pre_keys = []
+
+    # --- postblock dict: {"target": {source: {full_key: scaler}}}
+    # BridgeScalerTransform always slices ["target"] — match that structure here.
+    post_dict = {"target": {}}
+
+    for (field_type, dim), varnames in var_groups.items():
+        for varname in varnames:
+            if varname not in nc_vars:
+                continue
+            n_levels = int(ds_mean[varname].size)
+            sc = _make_scaler(varname, n_levels)
+            full_key = f"{source_name}/{field_type}/{dim}/{varname}"
+            pre_input[full_key] = sc
+            pre_keys.append(full_key)
+            if field_type in ("prognostic", "diagnostic"):
+                pre_target[full_key] = sc
+                post_dict["target"].setdefault(source_name, {})[full_key] = sc
+
+    ds_mean.close()
+    ds_std.close()
+
+    pre_dict = {"input": {source_name: pre_input}, "target": {source_name: pre_target}}
+    save_scaler_dict(pre_dict, pre_out)
+    save_scaler_dict(post_dict, post_out)
+
+    post_prog_vars = [
+        f"{source_name}/{ft}/{dim}/{varname}"
+        for (ft, dim), varnames in var_groups.items()
+        if ft == "prognostic"
+        for varname in varnames
+        if varname in nc_vars
+    ]
+    return pre_keys, post_prog_vars
+
+
+class _FlowSeqDumper(yaml.Dumper):
+    """YAML dumper that writes lists of scalars as flow sequences [a, b, c]."""
+
+    def represent_sequence(self, tag, sequence, flow_style=None):
+        if all(isinstance(x, (int, float, str, bool, type(None))) for x in sequence):
+            flow_style = True
+        return super().represent_sequence(tag, sequence, flow_style=flow_style)
+
+
+def _yaml_dump(conf, f):
+    yaml.dump(conf, f, Dumper=_FlowSeqDumper, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+
+_SPATIAL_TIME_DIMS = frozenset(("time", "lat", "lon", "latitude", "longitude", "x", "y"))
+
+
+def _zarr_dims(glob_path: str) -> list[str] | None:
+    """Return all dimension names from the first matching file, or None on failure."""
+    import glob as _glob
+
+    if not glob_path:
+        return None
+    candidates = sorted(_glob.glob(glob_path))
+    if not candidates:
+        return None
+    first = candidates[0]
+    try:
+        import xarray as xr
+
+        ds = (
+            xr.open_zarr(first, consolidated=False)
+            if (first.endswith(".zarr") or os.path.isdir(first))
+            else xr.open_dataset(first, engine="netcdf4")
+        )
+        dims = list(ds.dims)
+        ds.close()
+        return dims
+    except Exception:
+        return None
+
+
+def _write_reload_config(config_path: str) -> str:
+    """Patch trainer reload fields and write a reload config next to the checkpoint.
+
+    Reads the YAML at *config_path*, sets the five fields required for a clean
+    resume, and writes the result to ``<save_loc>/config_reload.yml``.
+
+    Returns the path to the written reload config.
+    """
+    with open(config_path) as f:
+        conf = yaml.safe_load(f)
+
+    trainer = conf.setdefault("trainer", {})
+    trainer["load_weights"] = True
+    trainer["load_optimizer"] = True
+    trainer["load_scaler"] = True
+    trainer["load_scheduler"] = True
+    trainer["reload_epoch"] = True
+
+    save_loc = os.path.expandvars(conf.get("save_loc", "."))
+    os.makedirs(save_loc, exist_ok=True)
+    reload_path = os.path.join(save_loc, "config_reload.yml")
+
+    with open(reload_path, "w") as f:
+        _yaml_dump(conf, f)
+
+    return reload_path
+
+
+def _convert(args: argparse.Namespace) -> None:
+    """Interactive v1 → v2 config converter."""
+    use_defaults = getattr(args, "defaults", False)
+    if use_defaults:
+
+        def prompt_bool(prompt, default=True):
+            return default
+
+        def prompt(prompt, default=None):
+            return str(default) if default is not None else ""
+
+    else:
+        prompt_bool = _prompt_bool
+        prompt = _prompt
+
+    with open(args.config) as f:
+        conf = yaml.safe_load(f)
+
+    trainer_type = conf.get("trainer", {}).get("type", "unknown")
+
+    print()
+    print("=" * 62)
+    print("  CREDIT config converter  (v1 → v2)")
+    print("=" * 62)
+    print(f"  Input  : {args.config}")
+    print(f"  Trainer: {trainer_type}")
+    print()
+
+    # ------------------------------------------------------------------
+    # Auto-transformations — no questions needed
+    # ------------------------------------------------------------------
+    changes = []
+
+    # trainer.type
+    V1_TYPES = {"era5", "era5-gen1", "standard", "universal"}
+    if trainer_type in V1_TYPES:
+        conf["trainer"]["type"] = "era5-gen2"
+        changes.append(f"trainer.type: '{trainer_type}' → 'era5-gen2'")
+
+    # trainer.parallelism — required by the v2 trainer; replaces legacy trainer.mode
+    if "parallelism" not in conf["trainer"]:
+        mode = conf["trainer"].pop("mode", "none")
+        domain_size = conf["trainer"].pop("domain_parallel_size", 1)
+        _mode_map = {
+            "fsdp": {"data": "fsdp2", "tensor": 1, "domain": 1},
+            "ddp": {"data": "ddp", "tensor": 1, "domain": 1},
+            "domain_parallel": {"data": "none", "tensor": 1, "domain": domain_size},
+            "fsdp+domain_parallel": {"data": "fsdp2", "tensor": 1, "domain": domain_size},
+        }
+        conf["trainer"]["parallelism"] = _mode_map.get(mode, {"data": "none", "tensor": 1, "domain": 1})
+        changes.append(f"trainer.mode: '{mode}' → trainer.parallelism: {conf['trainer']['parallelism']}")
+        if mode in ("fsdp", "fsdp+domain_parallel"):
+            print(
+                "WARNING: fsdp (FSDP1) checkpoints (model_checkpoint.pt / "
+                "optimizer_checkpoint.pt) cannot be resumed under fsdp2, which "
+                "reads checkpoint.pt['model_state_dict']. Existing FSDP1 runs "
+                "must keep their original config to resume; use the converted "
+                "config for new runs."
+            )
+    elif "mode" in conf["trainer"]:
+        conf["trainer"].pop("mode")
+        changes.append("removed legacy trainer.mode (parallelism block already present)")
+
+    # data schema: v1 flat → v2 nested source
+    _V1_DATA_FLAT_KEYS = {
+        "variables",
+        "surface_variables",
+        "dynamic_forcing_variables",
+        "static_variables",
+        "save_loc",
+        "save_loc_surface",
+        "save_loc_dynamic_forcing",
+        "save_loc_static",
+        "save_loc_diagnostic",
+        "diagnostic_variables",
+        "mean_path",
+        "std_path",
+        "train_years",
+        "valid_years",
+        "lead_time_periods",
+        "scaler_type",
+        "history_len",
+        "valid_history_len",
+        "dataset_type",
+        "static_first",
+        "skip_periods",
+        "one_shot",
+        "level_ids",
+    }
+    data = conf.get("data", {})
+    if "source" not in data and _V1_DATA_FLAT_KEYS & set(data.keys()):
+        vars_3d = data.get("variables") or []
+        vars_2d = data.get("surface_variables") or []
+        dyn_vars = data.get("dynamic_forcing_variables") or []
+        static_vars = data.get("static_variables") or []
+        diag_vars = data.get("diagnostic_variables") or []
+        prog_path = data.get("save_loc") or data.get("save_loc_surface") or ""
+        dyn_path = data.get("save_loc_dynamic_forcing") or ""
+        static_path = data.get("save_loc_static") or ""
+        diag_path = data.get("save_loc_diagnostic") or ""
+        mean_path = data.get("mean_path") or ""
+        std_path = data.get("std_path") or ""
+        lead_time = int(data.get("lead_time_periods") or 6)
+        train_years = data.get("train_years") or [1979, 2018]
+        valid_years = data.get("valid_years") or [2018, 2019]
+        n_levels = conf.get("model", {}).get("levels", 16)
+        _DEFAULT_LEVELS_16 = [10, 30, 40, 50, 60, 70, 80, 90, 95, 100, 105, 110, 120, 130, 136, 137]
+        levels = list(data["level_ids"]) if "level_ids" in data else _DEFAULT_LEVELS_16[:n_levels]
+
+        era5_vars = {
+            "prognostic": {
+                "vars_3D": vars_3d,
+                "vars_2D": vars_2d,
+                "path": prog_path,
+                "filename_time_format": "%Y",
+            },
+        }
+        if dyn_vars:
+            era5_vars["dynamic_forcing"] = {
+                "vars_2D": dyn_vars,
+                "path": dyn_path,
+                "filename_time_format": "%Y",
+            }
+        if static_vars:
+            era5_vars["static"] = {"vars_2D": static_vars, "path": static_path}
+        if diag_vars:
+            era5_vars["diagnostic"] = {
+                "vars_2D": diag_vars,
+                "path": diag_path,
+                "filename_time_format": "%Y",
+            }
+        else:
+            era5_vars["diagnostic"] = None
+
+        # Keep non-flat keys (forecast_len, valid_forecast_len, backprop_on_timestep, …)
+        keep_keys = {k: v for k, v in data.items() if k not in _V1_DATA_FLAT_KEYS}
+        level_coord = getattr(args, "level_coord", None) or ""
+        if not level_coord:
+            level_coord = prompt("level_coord (vertical coordinate name in your data files)", default="level").strip()
+        _all_dims = _zarr_dims(prog_path)
+        if _all_dims is not None and level_coord not in _all_dims:
+            print(f"  '{level_coord}' not found in file. Available options: {', '.join(_all_dims)}", file=sys.stderr)
+            level_coord = _prompt("Choose from the above").strip()
+
+        conf["data"] = {
+            "source": {
+                "ERA5": {"dataset_type": "local", "level_coord": level_coord, "levels": levels, "variables": era5_vars}
+            },
+            "timestep": f"{lead_time}h",
+            "forecast_len": data.get("forecast_len", 0),
+            "start_datetime": f"{train_years[0]}-01-01",
+            "end_datetime": f"{train_years[1]}-12-31",
+            **keep_keys,
+        }
+        conf.setdefault("validation_data", {}).update(
+            {
+                "start_datetime": f"{valid_years[0]}-01-01",
+                "end_datetime": f"{valid_years[1]}-12-31",
+            }
+        )
+        if mean_path or std_path:
+            # V1 configs often point to a residual (6h-difference) std file.
+            # V2 predicts absolute values, so the scaler must use absolute std.
+            # If the std_path looks like a residual file, try to find the absolute version.
+            if std_path and "residual" in os.path.basename(std_path):
+                abs_candidate = std_path.replace("std_residual", "std")
+                if os.path.exists(abs_candidate):
+                    changes.append(
+                        f"std_path: auto-switched from residual to absolute std ({os.path.basename(abs_candidate)})"
+                    )
+                    std_path = abs_candidate
+                else:
+                    print(
+                        "  WARNING: std_path appears to be a residual std file; V2 trains on absolute\n"
+                        "  values so loss will be inflated. Provide an absolute std file via --std-path.",
+                        file=sys.stderr,
+                    )
+            # Build BridgeScaler JSON files from old z-score NetCDF files.
+            # Group variables by (field_type, dim) so the converter knows the
+            # v2 key structure.
+            var_groups = {}
+            if vars_3d:
+                var_groups[("prognostic", "3d")] = vars_3d
+            if vars_2d:
+                var_groups[("prognostic", "2d")] = vars_2d
+            if dyn_vars:
+                var_groups[("dynamic_forcing", "2d")] = dyn_vars
+            if static_vars:
+                var_groups[("static", "2d")] = static_vars
+            if diag_vars:
+                var_groups[("diagnostic", "2d")] = diag_vars
+
+            base_out, _ = os.path.splitext(
+                getattr(args, "output", None)
+                or (
+                    f"{os.path.splitext(args.config)[0]}_gen2{os.path.splitext(args.config)[1]}"
+                    if os.path.splitext(args.config)[1]
+                    else f"{args.config}_gen2.yml"
+                )
+            )
+            pre_json = f"{base_out}_pre_scaler.json"
+            post_json = f"{base_out}_post_scaler.json"
+
+            pre_keys, post_prog_vars = _build_bridgescaler_jsons(mean_path, std_path, var_groups, pre_json, post_json)
+
+            if pre_keys is not None:
+                per_step_pre = conf.setdefault("preblocks", {}).setdefault("per_step", {})
+                per_step_pre["scaler"] = {
+                    "type": "bridgescaler_transform",
+                    "args": {
+                        "scaler_path": pre_json,
+                        "variables": pre_keys,
+                        "method": "transform",
+                    },
+                }
+                per_step_pre["concat"] = {"type": "concat"}
+                per_step_post = conf.setdefault("postblocks", {}).setdefault("per_step", {})
+                per_step_post["reconstruct"] = {"type": "reconstruct"}
+                per_step_post["scaler"] = {
+                    "type": "bridgescaler_transform",
+                    "args": {
+                        "scaler_path": post_json,
+                        "variables": post_prog_vars,
+                        "method": "inverse_transform",
+                    },
+                }
+                changes.append(f"preblocks.per_step.scaler: bridgescaler_transform → {pre_json}")
+                changes.append(f"postblocks.per_step.scaler: bridgescaler_transform (inverse) → {post_json}")
+            else:
+                # Fallback if bridgescaler/torch not available
+                per_step_pre = conf.setdefault("preblocks", {}).setdefault("per_step", {})
+                per_step_pre["norm"] = {
+                    "type": "era5_normalizer",
+                    "args": {"mean_path": mean_path, "std_path": std_path},
+                }
+                per_step_pre["concat"] = {"type": "concat"}
+                changes.append(
+                    "preblocks.per_step.norm: era5_normalizer (bridgescaler unavailable — install torch+bridgescaler to convert)"
+                )
+
+        changes.append(
+            f"data: flat V1 schema → nested V2 source schema  (ERA5, {n_levels} levels, timestep={lead_time}h)"
+        )
+        changes.append(f"data.start_datetime: {train_years[0]}-01-01 .. {train_years[1]}-12-31")
+        changes.append(f"validation_data: {valid_years[0]}-01-01 .. {valid_years[1]}-12-31")
+        changes.append("  NOTE: review data paths — glob patterns may need updating for v2 file layout")
+
+    # forecast_len: v1 uses 0 = single step, v2 uses 1 = single step
+    fl = conf.get("data", {}).get("forecast_len", 0)
+    new_fl = fl + 1
+    conf["data"]["forecast_len"] = new_fl
+    changes.append(f"data.forecast_len: {fl} → {new_fl}  (v2: 1 = single step)")
+
+    vfl = conf.get("data", {}).get("valid_forecast_len", fl)
+    new_vfl = vfl + 1
+    conf["data"]["valid_forecast_len"] = new_vfl
+    changes.append(f"data.valid_forecast_len: {vfl} → {new_vfl}")
+
+    print("  Auto-applied:")
+    for c in changes:
+        print(f"    + {c}")
+    print()
+
+    # ------------------------------------------------------------------
+    # New v2 trainer features
+    # ------------------------------------------------------------------
+    print("  --- New v2 trainer features ---")
+
+    use_ema = prompt_bool("Enable EMA (exponential moving average of weights)? Recommended", default=True)
+    conf["trainer"]["use_ema"] = use_ema
+    if use_ema:
+        ema_decay = prompt("EMA decay", default="0.9999")
+        conf["trainer"]["ema_decay"] = float(ema_decay)
+
+    use_tb = prompt_bool("Enable TensorBoard logging", default=True)
+    conf["trainer"]["use_tensorboard"] = use_tb
+    print()
+
+    # ------------------------------------------------------------------
+    # Ensemble detection
+    # ------------------------------------------------------------------
+    ensemble_size = conf.get("trainer", {}).get("ensemble_size", 1)
+    loss_type = conf.get("loss", {}).get("training_loss", "")
+    is_ensemble = ensemble_size > 1 or "crps" in loss_type.lower()
+
+    if is_ensemble:
+        print(f"  --- Ensemble settings (detected: ensemble_size={ensemble_size}, loss={loss_type}) ---")
+        keep_ensemble = prompt_bool("Keep ensemble training", default=True)
+        if keep_ensemble:
+            new_size = prompt("Ensemble size", default=str(ensemble_size))
+            conf["trainer"]["ensemble_size"] = int(new_size)
+        else:
+            conf["trainer"]["ensemble_size"] = 1
+            print("  Note: consider changing loss.training_loss from crps to mse or mae")
+        print()
+
+    # ------------------------------------------------------------------
+    # PBS / job settings — skip entirely if pbs: already in config
+    # ------------------------------------------------------------------
+    pbs = conf.get("pbs", {})
+    if not pbs:
+        print("  --- PBS / job settings ---")
+        cluster = prompt("Cluster (casper/derecho)", default="derecho")
+        account = prompt(
+            "PBS account code",
+            default=os.environ.get("PBS_ACCOUNT") or "NAML0001",
+        )
+        conda = prompt("Conda env (name or full path)", default="")
+        walltime = prompt("Walltime (HH:MM:SS)", default="12:00:00")
+        job_name = prompt("Job name", default="credit_gen2")
+
+        new_pbs = {"project": account, "job_name": job_name, "walltime": walltime, "conda": conda}
+
+        if cluster == "derecho":
+            new_pbs["nodes"] = int(prompt("Nodes", default="1"))
+            new_pbs["ngpus"] = int(prompt("GPUs per node", default="4"))
+            new_pbs["ncpus"] = int(prompt("CPUs per node", default="64"))
+            new_pbs["mem"] = prompt("Memory per node", default="480GB")
+            new_pbs["queue"] = prompt("Queue", default="main")
+        else:
+            new_pbs["ngpus"] = int(prompt("GPUs", default="4"))
+            new_pbs["ncpus"] = int(prompt("CPUs per node", default="8"))
+            new_pbs["mem"] = prompt("Memory", default="128GB")
+            gpu_type = prompt("GPU type ('any' for any NVIDIA GPGPU)", default="any")
+            if gpu_type and gpu_type.lower() not in ("any", "none"):
+                new_pbs["gpu_type"] = gpu_type
+            new_pbs["queue"] = prompt("Queue", default="casper")
+
+        conf["pbs"] = new_pbs
+
+    # ------------------------------------------------------------------
+    # Output
+    # ------------------------------------------------------------------
+    print()
+    base, ext = os.path.splitext(args.config)
+    default_out = getattr(args, "output", None) or (f"{base}_gen2{ext}" if ext else f"{args.config}_gen2.yml")
+    out_path = prompt("Output config path", default=default_out)
+
+    with open(out_path, "w") as f:
+        _yaml_dump(conf, f)
+
+    print()
+    print(f"  Saved → {out_path}")
+    print("=" * 62)
+    print()
+
+
+def _init(args: argparse.Namespace) -> None:
+    """Copy a config template to the user's desired location."""
+    import shutil
+
+    templates = {
+        ("0.25deg", "wxformer"): "config/gen_2/examples/wxformer_era5_025deg_6hr.yml",
+        ("0.25deg", "crossformer"): "config/gen_2/examples/wxformer_era5_025deg_6hr.yml",
+        ("1deg", "wxformer"): "config/gen_2/examples/example-v2026.2.yml",
+        ("1deg", "crossformer"): "config/gen_2/examples/example-v2026.2.yml",
+    }
+
+    repo = _repo_root()
+    key = (args.grid, args.model)
+    template_rel = templates.get(key)
+
+    if template_rel is None:
+        print(f"No template available for grid={args.grid}, model={args.model}", file=sys.stderr)
+        sys.exit(1)
+
+    template = os.path.join(repo, template_rel)
+    if not os.path.exists(template):
+        print(f"Template not found: {template}", file=sys.stderr)
+        sys.exit(1)
+
+    output = os.path.abspath(args.output)
+    if os.path.exists(output) and not args.force:
+        print(f"File already exists: {output}  (use --force to overwrite)", file=sys.stderr)
+        sys.exit(1)
+
+    parent = os.path.dirname(output)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    shutil.copy(template, output)
+    print(f"Created  : {output}")
+    print(f"Template : {template_rel}")
+    print()
+    print("Next steps:")
+    print("  1. Check 'save_loc' — defaults to /glade/derecho/scratch/$USER/CREDIT_runs/...")
+    print("     (NCAR users: no edits needed; others: update to a writable path)")
+    print("  2. Verify data paths under 'data.source'")
+    print("     (NCAR users: paths point to /glade/campaign/cisl/aiml/ksha/CREDIT_data/ — readable by all staff)")
+    print(f"  3. credit submit --cluster casper -c {output} --gpus 4 --chain 14")

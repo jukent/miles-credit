@@ -5,8 +5,49 @@ from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau, CosineAnnealingLR
 from credit.models.checkpoint import FSDPOptimizerWrapper
 
-update_on_batch = ["cosine-annealing-restarts"]
+update_on_batch = ["cosine-annealing-restarts", "linear-warmup-cosine"]
 update_on_epoch = ["lambda", "plateau", "cosine-annealing"]
+
+
+class LinearWarmupCosineScheduler(LRScheduler):
+    """Linear warmup followed by cosine decay to min_lr.
+
+    Steps are batch-level (call scheduler.step() after each optimizer.step()).
+
+    Args:
+        optimizer: Wrapped optimizer.
+        warmup_steps: Number of steps to linearly ramp lr from 0 to base_lr.
+        total_steps: Total number of steps (warmup + cosine decay).
+        min_lr: Minimum learning rate at the end of decay (absolute value).
+        last_epoch: Used by LRScheduler for resume; -1 means start from scratch.
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        warmup_steps: int = 1000,
+        total_steps: int = 500_000,
+        min_lr: float = 1e-5,
+        last_epoch: int = -1,
+    ):
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr = min_lr
+        super().__init__(optimizer, last_epoch=last_epoch)
+
+    def get_lr(self):
+        step = self.last_epoch
+        lrs = []
+        for base_lr in self.base_lrs:
+            if step < self.warmup_steps:
+                lr = base_lr * step / max(1, self.warmup_steps)
+            else:
+                progress = (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+                progress = min(progress, 1.0)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                lr = self.min_lr + (base_lr - self.min_lr) * cosine
+            lrs.append(lr)
+        return lrs
 
 
 def load_scheduler(optimizer, conf):
@@ -35,9 +76,9 @@ def load_scheduler(optimizer, conf):
         elif scheduler_type == "cosine-annealing":
             scheduler = CosineAnnealingLR(optimizer, **conf["trainer"]["scheduler"])
         elif scheduler_type == "cosine-annealing-restarts":
-            scheduler = CosineAnnealingWarmupRestarts(
-                optimizer, **conf["trainer"]["scheduler"]
-            )
+            scheduler = CosineAnnealingWarmupRestarts(optimizer, **conf["trainer"]["scheduler"])
+        elif scheduler_type == "linear-warmup-cosine":
+            scheduler = LinearWarmupCosineScheduler(optimizer, **conf["trainer"]["scheduler"])
         else:
             raise ValueError(f"Invalid scheduler_type: {scheduler_type}")
     else:
@@ -57,9 +98,7 @@ def phased_lr_lambda(step, total_updates_phase1=1000, total_updates_phase2=29900
     if step < total_updates_phase1:
         return lr_lambda_phase1(step, total_updates_phase1=total_updates_phase1)
     else:
-        return lr_lambda_phase2(
-            step - total_updates_phase1, total_updates_phase2=total_updates_phase2
-        )
+        return lr_lambda_phase2(step - total_updates_phase1, total_updates_phase2=total_updates_phase2)
 
 
 # https://arxiv.org/pdf/2312.03876.pdf
@@ -125,9 +164,7 @@ class CosineAnnealingWarmupRestarts(LRScheduler):
             return self.base_lrs
         elif self.step_in_cycle < self.warmup_steps:
             return [
-                (self.max_lr - base_lr) * self.step_in_cycle / self.warmup_steps
-                + base_lr
-                for base_lr in self.base_lrs
+                (self.max_lr - base_lr) * self.step_in_cycle / self.warmup_steps + base_lr for base_lr in self.base_lrs
             ]
         else:
             return [
@@ -136,9 +173,7 @@ class CosineAnnealingWarmupRestarts(LRScheduler):
                 * (
                     1
                     + math.cos(
-                        math.pi
-                        * (self.step_in_cycle - self.warmup_steps)
-                        / (self.cur_cycle_steps - self.warmup_steps)
+                        math.pi * (self.step_in_cycle - self.warmup_steps) / (self.cur_cycle_steps - self.warmup_steps)
                     )
                 )
                 / 2
@@ -153,8 +188,7 @@ class CosineAnnealingWarmupRestarts(LRScheduler):
                 self.cycle += 1
                 self.step_in_cycle = self.step_in_cycle - self.cur_cycle_steps
                 self.cur_cycle_steps = (
-                    int((self.cur_cycle_steps - self.warmup_steps) * self.cycle_mult)
-                    + self.warmup_steps
+                    int((self.cur_cycle_steps - self.warmup_steps) * self.cycle_mult) + self.warmup_steps
                 )
         else:
             if epoch >= self.first_cycle_steps:
@@ -164,22 +198,15 @@ class CosineAnnealingWarmupRestarts(LRScheduler):
                 else:
                     n = int(
                         math.log(
-                            (
-                                epoch / self.first_cycle_steps * (self.cycle_mult - 1)
-                                + 1
-                            ),
+                            (epoch / self.first_cycle_steps * (self.cycle_mult - 1) + 1),
                             self.cycle_mult,
                         )
                     )
                     self.cycle = n
                     self.step_in_cycle = epoch - int(
-                        self.first_cycle_steps
-                        * (self.cycle_mult**n - 1)
-                        / (self.cycle_mult - 1)
+                        self.first_cycle_steps * (self.cycle_mult**n - 1) / (self.cycle_mult - 1)
                     )
-                    self.cur_cycle_steps = self.first_cycle_steps * self.cycle_mult ** (
-                        n
-                    )
+                    self.cur_cycle_steps = self.first_cycle_steps * self.cycle_mult ** (n)
             else:
                 self.cur_cycle_steps = self.first_cycle_steps
                 self.step_in_cycle = epoch
@@ -190,9 +217,7 @@ class CosineAnnealingWarmupRestarts(LRScheduler):
             param_group["lr"] = lr
 
 
-def annealed_probability(
-    epoch, max_epochs=100, min_probability=0.01, max_probability=1.0
-):
+def annealed_probability(epoch, max_epochs=100, min_probability=0.01, max_probability=1.0):
     """
     Anneal the termination probability from 1 to a small value.
 

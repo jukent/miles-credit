@@ -11,7 +11,12 @@ from einops import rearrange, reduce
 
 from scipy.optimize import linear_sum_assignment
 from tqdm.auto import tqdm
-from credit.diffusion_utils import default, identity, normalize_to_neg_one_to_one, unnormalize_to_zero_to_one
+from credit.diffusion_utils import (
+    default,
+    identity,
+    normalize_to_neg_one_to_one,
+    unnormalize_to_zero_to_one,
+)
 
 ModelPrediction = namedtuple("ModelPrediction", ["pred_noise", "pred_x_start"])
 
@@ -134,7 +139,7 @@ class GaussianDiffusion(Module):
         immiscible=False,
     ):
         super().__init__()
-        assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
+        assert not (isinstance(GaussianDiffusion) and model.channels != model.out_dim)
         assert not hasattr(model, "random_or_learned_sinusoidal_cond") or not model.random_or_learned_sinusoidal_cond
 
         self.model = model
@@ -192,8 +197,8 @@ class GaussianDiffusion(Module):
         self.ddim_sampling_eta = ddim_sampling_eta
 
         # helper function to register buffer from float64 to float32
-
-        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
+        def register_buffer(name, val):
+            return self.register_buffer(name, val.to(torch.float32))
 
         register_buffer("betas", betas)
         register_buffer("alphas_cumprod", alphas_cumprod)
@@ -217,10 +222,17 @@ class GaussianDiffusion(Module):
 
         # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
 
-        register_buffer("posterior_log_variance_clipped", torch.log(posterior_variance.clamp(min=1e-20)))
-        register_buffer("posterior_mean_coef1", betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod))
         register_buffer(
-            "posterior_mean_coef2", (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod)
+            "posterior_log_variance_clipped",
+            torch.log(posterior_variance.clamp(min=1e-20)),
+        )
+        register_buffer(
+            "posterior_mean_coef1",
+            betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod),
+        )
+        register_buffer(
+            "posterior_mean_coef2",
+            (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod),
         )
 
         # immiscible diffusion
@@ -290,7 +302,15 @@ class GaussianDiffusion(Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_self_cond=None, x_cond=None, clip_x_start=False, rederive_pred_noise=False):
+    def model_predictions(
+        self,
+        x,
+        t,
+        x_self_cond=None,
+        x_cond=None,
+        clip_x_start=False,
+        rederive_pred_noise=False,
+    ):
         model_output = self.model(x, t, x_self_cond, x_cond)
         maybe_clip = partial(torch.clamp, min=-1.0, max=1.0) if clip_x_start else identity
 
@@ -329,7 +349,11 @@ class GaussianDiffusion(Module):
         b, *_, device = *x.shape, self.device
         batched_times = torch.full((b,), t, device=device, dtype=torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(
-            x=x, t=batched_times, x_self_cond=x_self_cond, x_cond=x_cond, clip_denoised=True
+            x=x,
+            t=batched_times,
+            x_self_cond=x_self_cond,
+            x_cond=x_cond,
+            clip_denoised=True,
         )
         noise = self.randn_like_fn(tensor=x) if t > 0 else 0.0  # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
@@ -342,7 +366,11 @@ class GaussianDiffusion(Module):
         imgs = [img]
 
         x_start = None
-        for t in tqdm(reversed(range(0, self.num_timesteps)), desc="sampling loop time step", total=self.num_timesteps):
+        for t in tqdm(
+            reversed(range(0, self.num_timesteps)),
+            desc="sampling loop time step",
+            total=self.num_timesteps,
+        ):
             self_cond = x_start if self.self_condition else None
             img, x_start = self.p_sample(img, t, self_cond, x_cond)
             imgs.append(img)
@@ -377,7 +405,12 @@ class GaussianDiffusion(Module):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
             self_cond = x_start if self.self_condition else None
             pred_noise, x_start, *_ = self.model_predictions(
-                img, time_cond, self_cond, x_cond, clip_x_start=True, rederive_pred_noise=True
+                img,
+                time_cond,
+                self_cond,
+                x_cond,
+                clip_x_start=True,
+                rederive_pred_noise=True,
             )
 
             if time_next < 0:
@@ -417,9 +450,17 @@ class GaussianDiffusion(Module):
 
     @torch.inference_mode()
     def sample(self, x_cond, batch_size=16, return_all_timesteps=False):
-        (h, w), channels, f = self.image_size, self.model.output_channels, self.model.frames
+        (h, w), channels, f = (
+            self.image_size,
+            self.model.output_channels,
+            self.model.frames,
+        )
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, f, h, w), x_cond, return_all_timesteps=return_all_timesteps)
+        return sample_fn(
+            (batch_size, channels, f, h, w),
+            x_cond,
+            return_all_timesteps=return_all_timesteps,
+        )
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, x_cond=None, t=None, lam=0.5):
